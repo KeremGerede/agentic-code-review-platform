@@ -10,6 +10,7 @@ All secrets below are fake test values. Do not use real API keys or passwords.
 
 import sqlite3
 import requests
+# pyrefly: ignore [missing-import]
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
