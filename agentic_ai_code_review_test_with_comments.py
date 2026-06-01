@@ -13,6 +13,7 @@ Gerçek gizli bilgi kullanma.
 
 import sqlite3
 import requests
+# pyrefly: ignore [missing-import]
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
