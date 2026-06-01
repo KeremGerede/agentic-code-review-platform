@@ -1,6 +1,5 @@
 from typing import List
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -14,6 +13,10 @@ class Settings(BaseSettings):
     # GitHub
     GITHUB_TOKEN: str
     GITHUB_WEBHOOK_SECRET: str
+
+    # Set to true ONLY during local development to skip signature verification.
+    # Never set this in production.
+    DEBUG_SKIP_WEBHOOK_SIGNATURE_CHECK: bool = False
 
     # CORS
     FRONTEND_URL: str = "http://localhost:5173"

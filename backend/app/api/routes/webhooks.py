@@ -2,6 +2,7 @@ import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException, status, Depends
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.security import verify_github_signature
@@ -18,26 +19,58 @@ router = APIRouter(prefix="/api/webhooks", tags=["Webhooks"])
 
 @router.post("/github", status_code=status.HTTP_202_ACCEPTED)
 async def github_webhook(request: Request, db: Session = Depends(get_db)):
-    # ── 1. Read raw body (must be done before .json()) ────────────────────────
-    raw_body = await request.body()
 
-    # ── 2. Verify signature ───────────────────────────────────────────────────
+    # ── 1. Log arrival immediately (before anything can fail) ─────────────────
+    logger.info(
+        "⬇️  Webhook request received — method=%s path=%s",
+        request.method, request.url.path,
+    )
+    logger.info(
+        "Webhook headers — X-GitHub-Event=%s X-GitHub-Delivery=%s Content-Type=%s",
+        request.headers.get("X-GitHub-Event", "MISSING"),
+        request.headers.get("X-GitHub-Delivery", "MISSING"),
+        request.headers.get("Content-Type", "MISSING"),
+    )
+
+    # ── 2. Read raw body (MUST happen before request.json()) ──────────────────
+    raw_body = await request.body()
+    logger.info("Webhook raw body length: %d bytes", len(raw_body))
+
+    if not raw_body:
+        logger.warning("Webhook received with empty body — ignoring.")
+        return {"message": "Empty body."}
+
+    # ── 3. Verify signature ───────────────────────────────────────────────────
     signature = request.headers.get("X-Hub-Signature-256")
+    logger.info("X-Hub-Signature-256 present: %s", "YES" if signature else "NO")
+
     if not verify_github_signature(raw_body, signature):
+        logger.error(
+            "❌ Webhook signature verification failed. "
+            "Check that GITHUB_WEBHOOK_SECRET matches the secret set in GitHub."
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid webhook signature.",
         )
 
-    # ── 3. Only handle push events ────────────────────────────────────────────
+    logger.info("✅ Webhook signature verified.")
+
+    # ── 4. Only handle push events ────────────────────────────────────────────
     event_type = request.headers.get("X-GitHub-Event", "")
+    logger.info("GitHub event type: %s", event_type)
+
     if event_type != "push":
         logger.info("Ignoring non-push event: %s", event_type)
         return {"message": f"Event '{event_type}' ignored."}
 
-    payload = await request.json()
+    # ── 5. Parse payload ──────────────────────────────────────────────────────
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.error("Failed to parse webhook JSON payload: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
-    # ── 4. Extract push event fields ─────────────────────────────────────────
     gh_repo = payload.get("repository", {})
     owner = gh_repo.get("owner", {}).get("login", "")
     repo_name = gh_repo.get("name", "")
@@ -55,18 +88,30 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     author = (
         head_commit.get("author", {}).get("name")
         or head_commit.get("committer", {}).get("name")
+        or payload.get("pusher", {}).get("name")
         or "unknown"
     )
 
+    logger.info(
+        "Push payload — repo=%s branch=%s before=%s after=%s author=%s",
+        full_name, pushed_branch,
+        before_sha[:7] if before_sha else "N/A",
+        after_sha[:7] if after_sha else "N/A",
+        author,
+    )
+
     if not owner or not repo_name or not after_sha:
-        logger.warning("Push event missing required fields.")
+        logger.warning(
+            "Push event missing required fields — owner=%r repo_name=%r after_sha=%r",
+            owner, repo_name, after_sha,
+        )
         return {"message": "Push event missing required fields."}
 
-    logger.info("Push event: %s branch=%s commit=%s", full_name, pushed_branch, after_sha[:7])
-
-    # ── 5. Find or create Repository ─────────────────────────────────────────
+    # ── 6. Find or create Repository ──────────────────────────────────────────
     repo = db.query(Repository).filter(Repository.full_name == full_name).first()
-    if not repo:
+    if repo:
+        logger.info("Repository already exists: %s (id=%d)", full_name, repo.id)
+    else:
         repo = Repository(
             name=repo_name,
             owner=owner,
@@ -78,9 +123,9 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
         db.add(repo)
         db.commit()
         db.refresh(repo)
-        logger.info("Auto-created repository: %s", full_name)
+        logger.info("✅ Auto-created new repository: %s (id=%d)", full_name, repo.id)
 
-    # ── 6. Create AnalysisRun ─────────────────────────────────────────────────
+    # ── 7. Create AnalysisRun immediately (visible in UI even if AI fails) ────
     run = AnalysisRun(
         repository_id=repo.id,
         commit_sha=after_sha,
@@ -91,18 +136,25 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
     db.add(run)
     db.commit()
     db.refresh(run)
-    logger.info("Created AnalysisRun id=%d", run.id)
+    logger.info("✅ Created AnalysisRun id=%d (status=running)", run.id)
 
+    # ── 8. Run analysis pipeline (errors are caught, run is marked failed) ────
     try:
-        # ── 7. Fetch changed files ────────────────────────────────────────────
-        changed_files = github_service.fetch_changed_files(owner, repo_name, before_sha, after_sha)
-
-        # ── 8. Load rules (global + repo-specific) ────────────────────────────
-        rules_query = db.query(Rule).filter(
-            Rule.is_enabled == True,
-            (Rule.repository_id == None) | (Rule.repository_id == repo.id),
+        changed_files = github_service.fetch_changed_files(
+            owner, repo_name, before_sha, after_sha
         )
-        rules = rules_query.all()
+        logger.info("Fetched %d analyzable file(s).", len(changed_files))
+
+        # Load enabled global rules + enabled repo-specific rules
+        rules_qs = db.query(Rule).filter(
+            Rule.is_enabled == True,
+            or_(Rule.repository_id == None, Rule.repository_id == repo.id),
+        )
+        active_rules = rules_qs.all()
+        logger.info(
+            "Loaded %d active rule(s) (global + repo-specific).", len(active_rules)
+        )
+
         rules_data = [
             {
                 "title": r.title,
@@ -110,10 +162,9 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
                 "category": r.category,
                 "severity": r.severity,
             }
-            for r in rules
+            for r in active_rules
         ]
 
-        # ── 9. Run agentic analysis ───────────────────────────────────────────
         repository_info = {
             "full_name": full_name,
             "owner": owner,
@@ -133,9 +184,9 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
             changed_files=changed_files,
         )
 
-        # ── 10. Save findings ─────────────────────────────────────────────────
+        # Save findings
         for f in result.findings:
-            finding = Finding(
+            db.add(Finding(
                 analysis_run_id=run.id,
                 file_path=f.file_path,
                 line_number=f.line_number,
@@ -146,10 +197,8 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
                 explanation=f.explanation,
                 suggestion=f.suggestion,
                 code_snippet=f.code_snippet,
-            )
-            db.add(finding)
+            ))
 
-        # ── 11. Mark run completed ────────────────────────────────────────────
         run.status = "completed"
         run.summary = result.summary
         run.risk_level = result.risk_level
@@ -158,17 +207,24 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
         run.completed_at = datetime.utcnow()
         db.commit()
         db.refresh(run)
-        logger.info("AnalysisRun id=%d completed: risk=%s findings=%d", run.id, run.risk_level, run.total_findings)
+        logger.info(
+            "✅ AnalysisRun id=%d completed — risk=%s findings=%d",
+            run.id, run.risk_level, run.total_findings,
+        )
 
     except Exception as exc:
-        logger.error("Analysis failed for run id=%d: %s", run.id, exc, exc_info=True)
+        logger.error(
+            "❌ Analysis pipeline failed for run id=%d: %s",
+            run.id, exc, exc_info=True,
+        )
         run.status = "failed"
         run.summary = f"Analysis failed: {str(exc)}"
         run.completed_at = datetime.utcnow()
         db.commit()
-        return {"message": "Analysis failed.", "run_id": run.id}
+        # Still send the (failed) response to GitHub so it doesn't retry endlessly
+        return {"message": "Analysis failed — run saved.", "run_id": run.id}
 
-    # ── 12. Send email (failure does not fail the run) ────────────────────────
+    # ── 9. Send email (failure must NOT affect run status) ────────────────────
     try:
         run_data = {
             "risk_level": run.risk_level,
@@ -201,8 +257,11 @@ async def github_webhook(request: Request, db: Session = Depends(get_db)):
         email_service.send_report(run_data, findings_data, repo_data)
         run.email_status = "sent"
         db.commit()
+        logger.info("✅ Report email sent for run id=%d.", run.id)
     except Exception as email_exc:
-        logger.error("Email sending failed for run id=%d: %s", run.id, email_exc)
+        logger.error(
+            "❌ Email sending failed for run id=%d: %s", run.id, email_exc
+        )
         run.email_status = "failed"
         run.email_error = str(email_exc)
         db.commit()
